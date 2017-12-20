@@ -1,1 +1,1 @@
-command: python $program/run.py $input $output $program
+command: python $program/run.py --input_dir $input --output_dir $output --program_dir $program
