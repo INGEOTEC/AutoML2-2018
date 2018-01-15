@@ -5,6 +5,8 @@ import time
 import os
 from sys import path
 import datetime
+import gc
+from sklearn.linear_model import LogisticRegression
 # import logging
 # logging.basicConfig(level=logging.INFO)
 ##############
@@ -149,8 +151,8 @@ the_date = datetime.datetime.now().strftime("%y-%m-%d-%H-%M")
 
 def time_to_predict(D):
     # time to predict
-    if D.data['X_train'].shape[0] > 1000:
-        incre = (D.data['X_valid'].shape[0] + D.data['X_test'].shape[0]) / float(D.data['X_train'].shape[0])
+    if D.info['train_num'] > 1000:
+        incre = (D.info.get('valid_num', 0) + D.info['test_num']) / float(D.info['train_num'])
         d = 0.03 * incre
         if d > 0.5:
             d = 0.5
@@ -199,6 +201,21 @@ if __name__ == "__main__" and debug_mode < 4:
     from data_manager import DataManager  # load/save data and get info about them
     from EvoDAG.model import EvoDAGE
     from EvoDAG.model import Model
+    from SparseArray import SparseArray
+    import numpy as np
+
+    def read_data(fname):
+        L = None
+        with open(fname) as fpt:
+            for r, l in enumerate(fpt.readlines()):
+                x = l.strip().split(' ')
+                if L is None:
+                    L = [list() for _ in x]
+                for c, v in enumerate(x):
+                    if v == 0:
+                        continue
+                    L[c].append([r, float(v)])
+        return Model.convert_features([SparseArray.index_data(x, r + 1) for x in L])
 
     if debug_mode >= 4:  # Show library version and directory structure
         data_io.show_dir(".")
@@ -228,16 +245,29 @@ if __name__ == "__main__" and debug_mode < 4:
         vprint(verbose,  "************************************************")
         vprint(verbose,  "******** Processing dataset " + basename.capitalize() + " ********")
         vprint(verbose,  "************************************************")
+        tmp_valid = os.path.join(program_dir, 'output', basename + '_valid.predict')
+        if os.path.isfile(tmp_valid):
+            os.link(tmp_valid, os.path.join(output_dir, basename + '_valid.predict'))
+        tmp_test = os.path.join(program_dir, 'output', basename + '_test.predict')
+        if os.path.isfile(tmp_test):
+            os.link(tmp_test, os.path.join(output_dir, basename + '_test.predict'))
+            vprint(verbose,  "[+] Results saved using cache")
+            continue
 
         # ======== Learning on a time budget:
         # Keep track of time not to exceed your time budget. Time spent to inventory data neglected.
         start = time.time()
 
         # ======== Creating a data object with data, informations about it
-        vprint(verbose,  "========= Reading and converting data ==========")
-        D = DataManager(basename, input_dir, replace_missing=True, filter_features=True, max_samples=max_samples, verbose=verbose)
-        print(D)
-        vprint(verbose,  "[+] Size of uploaded data  %5.2f bytes" % data_io.total_size(D))
+        vprint(verbose,  "========= Reading training set ==========")
+        D = DataManager(basename, input_dir, replace_missing=True,
+                        filter_features=True, max_samples=max_samples, verbose=verbose)
+        train_fname = os.path.join(input_dir, basename, basename + '_train.data')
+        label_fname = os.path.join(input_dir, basename, basename + '_train.solution')
+        valid_fname = os.path.join(input_dir, basename, basename + '_valid.data')
+        test_fname = os.path.join(input_dir, basename, basename + '_test.data')
+        X = read_data(train_fname)
+        y = np.array([float(x.strip()) for x in open(label_fname).readlines()])
 
         # ======== Keeping track of time
         if debug_mode < 1:
@@ -251,15 +281,12 @@ if __name__ == "__main__" and debug_mode < 4:
         vprint(verbose,  "[+] Time budget for this task %5.2f sec" % time_budget)
         time_spent = time.time() - start
         vprint(verbose,  "[+] Remaining time after reading data %5.2f sec" % (time_budget-time_spent))
-        if time_spent >= time_budget:
-            vprint(verbose,  "[-] Sorry, time budget exceeded, skipping this task")
-            execution_success = False
-            continue
 
         # ========= Creating a model, knowing its assigned task from D.info['task'].
         # The model can also select its hyper-parameters based on other elements of info.
         vprint(verbose,  "======== Creating model ==========")
-        M = EvoDAGE(n_jobs=2, classifier=True, time_limit=time_budget)
+        time_budget = 3600
+        M = EvoDAGE(n_jobs=16, classifier=True, time_limit=time_budget, fitness_function='macro-F1', Tanh=False)
         print(M)
 
         # ========= Iterating over learning cycles and keeping track of time
@@ -270,26 +297,38 @@ if __name__ == "__main__" and debug_mode < 4:
             execution_success = False
             continue
         time_predict_value = time_to_predict(D)
-        D.data['X_train'] = Model.convert_features(D.data['X_train'])
         time_budget = time_budget - time_spent  # Remove time spent so far
         start = time.time()                     # Reset the counter
         time_spent = 0                          # Initialize time spent learning
-        M.time_limit = time_budget * time_predict_value - 20
+        M.time_limit = time_budget * time_predict_value * 0.9
         vprint(verbose,  "[+] Time budget to train the model %5.2f sec" % M._time_limit)
-        M.fit(D.data['X_train'], D.data['Y_train'])
+        Xtest = None
+        if D.info['test_num'] < 1000:
+            Xtest = np.array([x.hy.full_array() for x in read_data(test_fname)]).T
+        M.fit(X, y, test_set=Xtest)
+        # log_reg = LogisticRegression(random_state=0, class_weight='balanced')
+        # log_reg.fit(M.raw_decision_function(X), y)
         vprint(verbose, "=========== " + basename.capitalize() + " Training cycle " + " ================")
         vprint(verbose, "[+] Fitting success, time spent so far %5.2f sec" % (time.time() - start))
         vprint(verbose, "[+] Size of trained model  %5.2f bytes" % data_io.total_size(M))
         # Make predictions
         # -----------------
-        Y_valid = M.predict_proba(D.data['X_valid'])[:, 1]
-        Y_test = M.predict_proba(D.data['X_test'])[:, 1]
+        if os.path.isfile(valid_fname):
+            Y_valid = M.predict_proba(read_data(valid_fname))[:, 1]
+            # Y_valid = log_reg.predict_proba(M.raw_decision_function(read_data(valid_fname)))[:, 1]
+        else:
+            Y_valid = None
+        if Xtest is None:
+            Xtest = read_data(test_fname)
+        Y_test = M.predict_proba(Xtest)[:, 1]
+        # Y_test = log_reg.predict_proba(M.raw_decision_function(read_data(test_fname)))[:, 1]
         vprint(verbose,  "[+] Prediction success, time spent so far %5.2f sec" % (time.time() - start))
         # Write results
         # -------------
         filename_valid = basename + '_valid.predict'
         filename_test = basename + '_test.predict'
-        data_io.write(os.path.join(output_dir, filename_valid), Y_valid)
+        if Y_valid is not None:
+            data_io.write(os.path.join(output_dir, filename_valid), Y_valid)
         data_io.write(os.path.join(output_dir, filename_test), Y_test)
         vprint(verbose,  "[+] Results saved, time spent so far %5.2f sec" % (time.time() - start))
         time_spent = time.time() - start
@@ -297,7 +336,8 @@ if __name__ == "__main__" and debug_mode < 4:
         vprint(verbose,  "[+] End cycle, time left %5.2f sec" % time_left_over)
         if time_left_over <= 0:
             execution_success = False
-
+        X = None
+        gc.collect()
     overall_time_spent = time.time() - overall_start
     if execution_success:
         vprint(verbose,  "[+] Done")

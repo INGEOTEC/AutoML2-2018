@@ -74,7 +74,7 @@ class DataManager:
 		self.getInfo (info_file)
          	self.feat_type = self.loadType (os.path.join(self.input_dir, basename + '_feat.type'), verbose=verbose)
 		self.data = {}  
-  		#if True: return
+  		if True: return
 		Xtr = self.loadData (os.path.join(self.input_dir, basename + '_train.data'), verbose=verbose, replace_missing=replace_missing)
 		Ytr = self.loadLabel (os.path.join(self.input_dir, basename + '_train.solution'), verbose=verbose)
 		max_samples = min(Xtr.shape[0], max_samples)             
